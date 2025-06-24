@@ -4,7 +4,6 @@
 package webhookeventreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/webhookeventreceiver"
 
 import (
-	"bufio"
 	"compress/gzip"
 	"context"
 	"errors"
@@ -37,6 +36,7 @@ var (
 const healthyResponse = `{"text": "Webhookevent receiver is healthy"}`
 
 type eventReceiver struct {
+	log                 *zap.Logger
 	settings            receiver.Settings
 	cfg                 *Config
 	logConsumer         consumer.Logs
@@ -78,6 +78,7 @@ func newLogsReceiver(params receiver.Settings, cfg Config, consumer consumer.Log
 	// create eventReceiver instance
 	er := &eventReceiver{
 		settings:            params,
+		log:                 params.Logger,
 		cfg:                 &cfg,
 		logConsumer:         consumer,
 		obsrecv:             obsrecv,
@@ -196,9 +197,7 @@ func (er *eventReceiver) handleReq(w http.ResponseWriter, r *http.Request, _ htt
 		defer er.gzipPool.Put(reader)
 	}
 
-	// send body into a scanner and then convert the request body into a log
-	sc := bufio.NewScanner(bodyReader)
-	ld, numLogs := er.reqToLog(sc, r.Header, r.URL.Query())
+	ld, numLogs := er.reqToLog(bodyReader, r.Header, r.URL.Query())
 	consumerErr := er.logConsumer.ConsumeLogs(ctx, ld)
 
 	_ = bodyReader.Close()

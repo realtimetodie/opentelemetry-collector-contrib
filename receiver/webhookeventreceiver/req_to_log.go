@@ -5,14 +5,17 @@ package webhookeventreceiver // import "github.com/open-telemetry/opentelemetry-
 
 import (
 	"bufio"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 	"time"
 
+	jsoniter "github.com/json-iterator/go"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/webhookeventreceiver/internal/metadata"
 )
@@ -21,26 +24,10 @@ const (
 	headerNamespace = "header"
 )
 
-func (er *eventReceiver) reqToLog(sc *bufio.Scanner,
+func (er *eventReceiver) reqToLog(bodyReader io.Reader,
 	headers http.Header,
 	query url.Values,
 ) (plog.Logs, int) {
-	if er.cfg.SplitLogsAtNewLine {
-		sc.Split(bufio.ScanLines)
-	} else {
-		// we simply dont split the data passed into scan (i.e. scan the whole thing)
-		// the downside to this approach is that only 1 log per request can be handled.
-		// NOTE: logs will contain these newline characters which could have formatting
-		// consequences downstream.
-		split := func(data []byte, atEOF bool) (advance int, token []byte, err error) {
-			if !atEOF {
-				return 0, nil, nil
-			}
-			return 0, data, bufio.ErrFinalToken
-		}
-		sc.Split(split)
-	}
-
 	log := plog.NewLogs()
 	resourceLog := log.ResourceLogs().AppendEmpty()
 	appendMetadata(resourceLog, query)
@@ -51,13 +38,56 @@ func (er *eventReceiver) reqToLog(sc *bufio.Scanner,
 	scopeLog.Scope().Attributes().PutStr("source", er.settings.ID.String())
 	scopeLog.Scope().Attributes().PutStr("receiver", metadata.Type.String())
 
-	for sc.Scan() {
-		logRecord := scopeLog.LogRecords().AppendEmpty()
-		logRecord.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
-		line := sc.Text()
-		logRecord.Body().SetStr(line)
-		if er.includeHeadersRegex != nil {
-			appendHeaders(headers, logRecord, er.includeHeadersRegex)
+	if er.cfg.SplitLogsJsonArray {
+		var data []any
+		decoder := jsoniter.NewDecoder(bodyReader)
+		err := decoder.Decode(&data)
+
+		if err == nil {
+			for _, element := range data {
+				data, err := jsoniter.MarshalToString(&element)
+				if err == nil {
+					logRecord := scopeLog.LogRecords().AppendEmpty()
+					logRecord.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+
+					logRecord.Body().SetStr(data)
+					if er.includeHeadersRegex != nil {
+						appendHeaders(headers, logRecord, er.includeHeadersRegex)
+					}
+				} else {
+					er.log.Error("error encoding JSON array element to log record body", zap.String("source", er.settings.ID.String()), zap.Error(err))
+				}
+			}
+		} else {
+			er.log.Error("error decoding JSON body", zap.String("source", er.settings.ID.String()), zap.Error(err))
+		}
+	} else {
+		// send body into a scanner and then convert the request body into a log
+		sc := bufio.NewScanner(bodyReader)
+		if er.cfg.SplitLogsAtNewLine {
+			sc.Split(bufio.ScanLines)
+		} else {
+			// we simply dont split the data passed into scan (i.e. scan the whole thing)
+			// the downside to this approach is that only 1 log per request can be handled.
+			// NOTE: logs will contain these newline characters which could have formatting
+			// consequences downstream.
+			split := func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+				if !atEOF {
+					return 0, nil, nil
+				}
+				return 0, data, bufio.ErrFinalToken
+			}
+			sc.Split(split)
+		}
+
+		for sc.Scan() {
+			logRecord := scopeLog.LogRecords().AppendEmpty()
+			logRecord.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+			line := sc.Text()
+			logRecord.Body().SetStr(line)
+			if er.includeHeadersRegex != nil {
+				appendHeaders(headers, logRecord, er.includeHeadersRegex)
+			}
 		}
 	}
 
